@@ -392,18 +392,26 @@ static void usbtv_image_chunk(struct usbtv *usbtv, u32 *chunk)
 	if (chunk_no >= usbtv->n_chunks)
 		return;
 
-	/* Beginning of a frame. */
-	if (chunk_no == 0) {
-		usbtv->frame_id = frame_id;
-		usbtv->chunks_done = 0;
-	}
-
-	if (usbtv->frame_id != frame_id)
-		return;
-
 	spin_lock_irqsave(&usbtv->buflock, flags);
 	if (list_empty(&usbtv->bufs)) {
 		/* No free buffers. Userspace likely too slow. */
+		spin_unlock_irqrestore(&usbtv->buflock, flags);
+		return;
+	}
+
+	/* Beginning of a frame. */
+	if (chunk_no == 0) {
+		usbtv->chunks_done = 0;
+		/* Only process odd frames (bottom field) if top field (first
+		 * in temporal order) the has been processed */
+		if (!odd || (odd && frame_id == ((usbtv->frame_id + 1) % 0xFF)))
+			usbtv->frame_id = frame_id;
+	}
+
+	if (usbtv->frame_id != frame_id) {
+		/* Start from the beginning of the frame. Do not bother
+		 * processing incomplete frames as this would just use buffers
+		 * which will return VB2_BUF_STATE_ERROR */
 		spin_unlock_irqrestore(&usbtv->buflock, flags);
 		return;
 	}
