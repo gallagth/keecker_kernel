@@ -33,6 +33,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
+#include <linux/poll.h>
 #include <linux/videodev2.h>
 
 #include <media/v4l2-device.h>
@@ -343,6 +344,15 @@ static int usbtv_setup_capture(struct usbtv *usbtv)
 	return 0;
 }
 
+static void v4l2_get_timestamp(struct timeval *tv)
+{
+	struct timespec ts;
+
+	ktime_get_ts(&ts);
+	tv->tv_sec = ts.tv_sec;
+	tv->tv_usec = ts.tv_nsec / NSEC_PER_USEC;
+}
+
 /* Copy data from chunk into a frame buffer, deinterlacing the data
  * into every second line. Unfortunately, they don't align nicely into
  * 720 pixel lines, as the chunk is 240 words long, which is 480 pixels.
@@ -445,7 +455,8 @@ static void usbtv_iso_cb(struct urb *ip)
 		return;
 	/* Unknown error. Retry. */
 	default:
-		dev_warn(usbtv->dev, "Bad response for ISO request.\n");
+		dev_warn(usbtv->dev, "Bad response for ISO request: %d.\n",
+				ip->status);
 		goto resubmit;
 	}
 
@@ -574,9 +585,8 @@ static int usbtv_querycap(struct file *file, void *priv,
 	strlcpy(cap->driver, "usbtv", sizeof(cap->driver));
 	strlcpy(cap->card, "usbtv", sizeof(cap->card));
 	usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
-	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE;
-	cap->device_caps |= V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
-	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
+	cap->capabilities = V4L2_CAP_VIDEO_CAPTURE;
+	cap->capabilities |= V4L2_CAP_READWRITE | V4L2_CAP_STREAMING;
 	return 0;
 }
 
@@ -636,13 +646,13 @@ static int usbtv_g_std(struct file *file, void *priv, v4l2_std_id *norm)
 	return 0;
 }
 
-static int usbtv_s_std(struct file *file, void *priv, v4l2_std_id norm)
+static int usbtv_s_std(struct file *file, void *priv, v4l2_std_id *norm)
 {
 	int ret = -EINVAL;
 	struct usbtv *usbtv = video_drvdata(file);
 
-	if ((norm & V4L2_STD_525_60) || (norm & V4L2_STD_PAL))
-		ret = usbtv_select_norm(usbtv, norm);
+	if ((*norm & V4L2_STD_525_60) || (*norm & V4L2_STD_PAL))
+		ret = usbtv_select_norm(usbtv, *norm);
 
 	return ret;
 }
@@ -660,6 +670,142 @@ static int usbtv_s_input(struct file *file, void *priv, unsigned int i)
 	return usbtv_select_input(usbtv, i);
 }
 
+static int usbtv_enum_framesizes(struct file *file, void *fh,
+		struct v4l2_frmsizeenum *fsize)
+{
+	struct usbtv *dev = video_drvdata(file);
+
+	/* TODO: Add support for PAL frame size */
+	if (fsize->index == 0) {
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = dev->width;
+		fsize->discrete.height = dev->height;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int usbtv_enum_frameintervals(struct file *file, void *fh,
+		struct v4l2_frmivalenum *fival)
+{
+	struct usbtv *dev = video_drvdata(file);
+
+	/* TODO: Add support for PAL frame rate, if different */
+	if (fival->height == dev->width && fival->width == dev->height) {
+		fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+		fival->discrete.numerator = 1;
+		fival->discrete.denominator = 30;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int usbtv_s_parm(struct file *file, void *__fh,
+			    struct v4l2_streamparm *sp)
+{
+	return 0;
+}
+
+static int usbtv_reqbufs(struct file *file, void *priv,
+			  struct v4l2_requestbuffers *p)
+{
+	struct usbtv *dev = video_drvdata(file);
+	return vb2_reqbufs(&dev->vb2q, p);
+}
+
+
+static int usbtv_querybuf(struct file *file, void *priv, struct v4l2_buffer *p)
+{
+	struct usbtv *dev = video_drvdata(file);
+	return vb2_querybuf(&dev->vb2q, p);
+}
+
+static int usbtv_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
+{
+	struct usbtv *dev = video_drvdata(file);
+	return vb2_qbuf(&dev->vb2q, p);
+}
+
+static int usbtv_dqbuf(struct file *file, void *priv, struct v4l2_buffer *p)
+{
+	struct usbtv *dev = video_drvdata(file);
+	return vb2_dqbuf(&dev->vb2q, p, file->f_flags & O_NONBLOCK);
+}
+
+
+static int usbtv_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
+{
+	struct usbtv *dev = video_drvdata(file);
+	return vb2_streamon(&dev->vb2q, i);
+}
+
+
+static int usbtv_streamoff(struct file *file, void *priv, enum v4l2_buf_type i)
+{
+	struct usbtv *dev = video_drvdata(file);
+	return vb2_streamoff(&dev->vb2q, i);
+}
+
+static ssize_t usbtv_read(struct file *file, char __user *data, size_t count,
+				loff_t *ppos)
+{
+	struct usbtv *dev = video_drvdata(file);
+	int err;
+
+	if (mutex_lock_interruptible(&dev->vb2q_lock))
+		return -ERESTARTSYS;
+	err = vb2_read(&dev->vb2q, data, count, ppos,
+		       file->f_flags & O_NONBLOCK);
+	mutex_unlock(&dev->vb2q_lock);
+	return err;
+}
+
+static unsigned int usbtv_poll(struct file *file,
+		struct poll_table_struct *wait)
+{
+	struct usbtv *dev = video_drvdata(file);
+	struct vb2_queue *q = &dev->vb2q;
+	int err;
+	unsigned long req_events = (wait ? wait->key : ~0UL);
+	bool must_lock = false;
+
+	if (q->num_buffers == 0 && q->fileio == NULL) {
+		if (!V4L2_TYPE_IS_OUTPUT(q->type) && (q->io_modes & VB2_READ) &&
+				(req_events & (POLLIN | POLLRDNORM)))
+			must_lock = true;
+		else if (V4L2_TYPE_IS_OUTPUT(q->type) && (q->io_modes & VB2_WRITE) &&
+				(req_events & (POLLOUT | POLLWRNORM)))
+			must_lock = true;
+	}
+	if (must_lock && mutex_lock_interruptible(&dev->vb2q_lock))
+		return POLLERR;
+
+	err = vb2_poll(q, file, wait);
+	if (must_lock)
+		mutex_unlock(&dev->vb2q_lock);
+	return err;
+}
+
+static int usbtv_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct usbtv *dev = video_drvdata(file);
+	int ret;
+
+	if (mutex_lock_interruptible(&dev->vb2q_lock))
+		return -ERESTARTSYS;
+	ret = vb2_mmap(&dev->vb2q, vma);
+	mutex_unlock(&dev->vb2q_lock);
+	return ret;
+}
+
+static int usbtv_fop_release(struct file *file)
+{
+	struct usbtv *dev = video_drvdata(file);
+
+	vb2_queue_release(&dev->vb2q);
+	return v4l2_fh_release(file);
+}
+
 struct v4l2_ioctl_ops usbtv_ioctl_ops = {
 	.vidioc_querycap = usbtv_querycap,
 	.vidioc_enum_input = usbtv_enum_input,
@@ -671,30 +817,30 @@ struct v4l2_ioctl_ops usbtv_ioctl_ops = {
 	.vidioc_s_std = usbtv_s_std,
 	.vidioc_g_input = usbtv_g_input,
 	.vidioc_s_input = usbtv_s_input,
+	.vidioc_enum_framesizes = usbtv_enum_framesizes,
+	.vidioc_enum_frameintervals = usbtv_enum_frameintervals,
 
-	.vidioc_reqbufs = vb2_ioctl_reqbufs,
-	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
-	.vidioc_querybuf = vb2_ioctl_querybuf,
-	.vidioc_create_bufs = vb2_ioctl_create_bufs,
-	.vidioc_qbuf = vb2_ioctl_qbuf,
-	.vidioc_dqbuf = vb2_ioctl_dqbuf,
-	.vidioc_streamon = vb2_ioctl_streamon,
-	.vidioc_streamoff = vb2_ioctl_streamoff,
+	.vidioc_reqbufs = usbtv_reqbufs,
+	.vidioc_querybuf = usbtv_querybuf,
+	.vidioc_qbuf = usbtv_qbuf,
+	.vidioc_dqbuf = usbtv_dqbuf,
+	.vidioc_streamon = usbtv_streamon,
+	.vidioc_streamoff = usbtv_streamoff,
+	.vidioc_s_parm = usbtv_s_parm,
 };
 
 struct v4l2_file_operations usbtv_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = video_ioctl2,
-	.mmap = vb2_fop_mmap,
+	.mmap = usbtv_mmap,
 	.open = v4l2_fh_open,
-	.release = vb2_fop_release,
-	.read = vb2_fop_read,
-	.poll = vb2_fop_poll,
+	.release = usbtv_fop_release,
+	.read = usbtv_read,
+	.poll = usbtv_poll,
 };
 
-static int usbtv_queue_setup(struct vb2_queue *vq,
-	const struct v4l2_format *v4l_fmt, unsigned int *nbuffers,
-	unsigned int *nplanes, unsigned int sizes[], void *alloc_ctxs[])
+static int usbtv_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
+	unsigned int *nplanes, unsigned long sizes[], void *alloc_ctxs[])
 {
 	struct usbtv *usbtv = vb2_get_drv_priv(vq);
 
@@ -722,7 +868,7 @@ static void usbtv_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&usbtv->buflock, flags);
 }
 
-static int usbtv_start_streaming(struct vb2_queue *vq, unsigned int count)
+static int usbtv_start_streaming(struct vb2_queue *vq)
 {
 	struct usbtv *usbtv = vb2_get_drv_priv(vq);
 
@@ -775,7 +921,8 @@ static int usbtv_probe(struct usb_interface *intf,
 
 	/* Packet size is split into 11 bits of base size and count of
 	 * extra multiplies of it.*/
-	size = usb_endpoint_maxp(&intf->altsetting[1].endpoint[0].desc);
+	size = __le16_to_cpu(intf->altsetting[1]
+			.endpoint[0].desc.wMaxPacketSize);
 	size = (size & 0x07ff) * (((size & 0x1800) >> 11) + 1);
 
 	/* Device structure */
@@ -801,8 +948,6 @@ static int usbtv_probe(struct usb_interface *intf,
 	usbtv->vb2q.buf_struct_size = sizeof(struct usbtv_buf);
 	usbtv->vb2q.ops = &usbtv_vb2_ops;
 	usbtv->vb2q.mem_ops = &vb2_vmalloc_memops;
-	usbtv->vb2q.timestamp_type = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	usbtv->vb2q.lock = &usbtv->vb2q_lock;
 	ret = vb2_queue_init(&usbtv->vb2q);
 	if (ret < 0) {
 		dev_warn(dev, "Could not initialize videobuf2 queue\n");
@@ -826,7 +971,6 @@ static int usbtv_probe(struct usb_interface *intf,
 	usbtv->vdev.fops = &usbtv_fops;
 	usbtv->vdev.ioctl_ops = &usbtv_ioctl_ops;
 	usbtv->vdev.tvnorms = USBTV_TV_STD;
-	usbtv->vdev.queue = &usbtv->vb2q;
 	usbtv->vdev.lock = &usbtv->v4l2_lock;
 	set_bit(V4L2_FL_USE_FH_PRIO, &usbtv->vdev.flags);
 	video_set_drvdata(&usbtv->vdev, usbtv);
@@ -880,4 +1024,14 @@ struct usb_driver usbtv_usb_driver = {
 	.disconnect = usbtv_disconnect,
 };
 
-module_usb_driver(usbtv_usb_driver);
+static int __init usbtv_driver_init(void)
+{
+	return usb_register(&usbtv_usb_driver);
+}
+module_init(usbtv_driver_init);
+
+static void __exit usbtv_driver_exit(void)
+{
+	usb_deregister(&usbtv_usb_driver);
+}
+module_exit(usbtv_driver_exit);
