@@ -698,14 +698,11 @@ static int usbtv_enum_frameintervals(struct file *file, void *fh,
 {
 	struct usbtv *dev = video_drvdata(file);
 
-	/* TODO: Add support for PAL frame rate, if different */
-	if (fival->height == dev->width && fival->width == dev->height) {
-		fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-		fival->discrete.numerator = 1;
-		fival->discrete.denominator = 30;
-		return 0;
-	}
-	return -EINVAL;
+	/* TODO: do not hardcode framerate (especially for pal support) */
+	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+	fival->discrete.numerator = 1;
+	fival->discrete.denominator = 30;
+	return 0;
 }
 
 static int usbtv_s_parm(struct file *file, void *__fh,
