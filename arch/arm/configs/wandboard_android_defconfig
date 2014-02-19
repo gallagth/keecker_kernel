@@ -30,6 +30,11 @@ CONFIG_VECTORS_BASE=0xffff0000
 CONFIG_DEFCONFIG_LIST="/lib/modules/$UNAME_RELEASE/.config"
 CONFIG_HAVE_IRQ_WORK=y
 
+#needed for paid apps support
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_CRYPT=y
+CONFIG_DM_UEVENT=y
+
 #
 # General setup
 #
@@ -1206,7 +1211,7 @@ CONFIG_ATA_BMDMA=y
 #
 # CONFIG_ATA_GENERIC is not set
 # CONFIG_PATA_LEGACY is not set
-# CONFIG_MD is not set
+CONFIG_MD=y
 # CONFIG_TARGET_CORE is not set
 # CONFIG_FUSION is not set
 
